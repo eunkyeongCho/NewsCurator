@@ -1,0 +1,45 @@
+{
+  "settings": {
+    "analysis": {
+      "analyzer": {
+        "korean": {
+          "type": "nori"
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "title": {
+        "type": "text",
+        "analyzer": "korean",
+        "fields": {
+          "keyword": { "type": "keyword" }
+        }
+      },
+      "content": {
+        "type": "text",
+        "analyzer": "korean"
+      },
+      "writer": {
+        "type": "text",
+        "fields": {
+          "keyword": { "type": "keyword" }
+        }
+      },
+      "email": { "type": "keyword" },
+      "category": { "type": "keyword" },
+      "keywords": { "type": "keyword" },
+      "write_date": { "type": "date" },
+      "url": { "type": "keyword" },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 768,
+        "index": true,
+        "similarity": "cosine"
+      },
+      "views": { "type": "integer" },
+      "updated_at": { "type": "date" }
+    }
+  }
+} 

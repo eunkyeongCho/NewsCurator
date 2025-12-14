@@ -1,0 +1,58 @@
+# Dockerfile-airflow
+FROM apache/airflow:2.2.3
+
+USER root
+
+# Java 보안 설정 디렉토리 생성
+RUN mkdir -p /etc/ssl/certs/java
+
+# Java 설치 + 폰트 설치 같이
+RUN apt update && \
+    apt install -y ca-certificates-java && \
+    apt install -y \
+    openjdk-11-jdk \
+    curl \
+    wget \
+    unzip \
+    fontconfig \
+    fonts-nanum \
+    libfreetype6-dev \
+    libpng-dev \
+    libjpeg-dev \
+    python3-dev \
+    gcc \
+    g++ \
+    make \
+    pkg-config && \
+    update-ca-certificates && \
+    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/java/cacerts
+
+# Spark 설치
+ENV SPARK_VERSION=3.1.1
+ENV SPARK_HOME=/opt/spark
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+ENV PATH="${JAVA_HOME}/bin:${SPARK_HOME}/bin:${PATH}"
+
+RUN wget https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.2.tgz && \
+    tar -xvzf spark-${SPARK_VERSION}-bin-hadoop3.2.tgz -C /opt/ && \
+    mv /opt/spark-${SPARK_VERSION}-bin-hadoop3.2 $SPARK_HOME && \
+    rm spark-${SPARK_VERSION}-bin-hadoop3.2.tgz
+
+# 폰트 캐시 갱신
+RUN fc-cache -fv
+
+# 시작 스크립트 생성 및 권한 설정
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Airflow 사용자로 전환
+USER airflow
+
+# Python 패키지 설치
+RUN pip install --no-cache-dir \
+    apache-airflow-providers-apache-spark \
+    pyspark==3.1.1 \
+    matplotlib
+
+# Standalone 모드로 실행
+CMD ["airflow", "standalone"] 

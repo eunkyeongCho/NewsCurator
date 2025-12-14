@@ -1,0 +1,423 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: wurstmeister/zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    networks:
+      - data-network
+
+  kafka:
+    image: wurstmeister/kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ADVERTISED_HOST_NAME: kafka
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  postgres:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-news}
+      POSTGRES_USER: ${POSTGRES_USER:-ssafyuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ssafyuser -d news"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  elasticsearch:
+    build:
+      context: ./elasticsearch
+      dockerfile: Dockerfile
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+      - ./elasticsearch/mappings:/usr/share/elasticsearch/mappings
+      - ./elasticsearch/init:/usr/local/bin/init
+    healthcheck:
+      test: curl -s http://localhost:9200/_cluster/health | grep -q 'status.*green\|status.*yellow'
+      interval: 20s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.9.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: curl -s http://localhost:5601/api/status | grep -q 'Looking good'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    networks:
+      - data-network
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    restart: always
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    environment:
+      - CLUSTER_NAME=test
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    restart: always
+    depends_on:
+      - namenode
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: 2
+    networks:
+      - data-network
+
+  jobmanager:
+    build:
+      context: .
+      dockerfile: flink-cluster.Dockerfile
+    container_name: jobmanager
+    ports:
+      - "8081:8081"
+      - "6123:6123"
+    command: jobmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+    networks:
+      - data-network
+
+  taskmanager:
+    build:
+      context: .
+      dockerfile: flink-cluster.Dockerfile
+    container_name: taskmanager
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+    networks:
+      - data-network
+
+  spark-master:
+    image: bde2020/spark-master:3.1.1-hadoop3.2
+    container_name: spark-master
+    ports:
+      - "8082:8080"
+      - "7077:7077"
+    environment:
+      - INIT_DAEMON_STEP=setup_spark
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  spark-worker:
+    image: bde2020/spark-worker:3.1.1-hadoop3.2
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - "SPARK_MASTER=spark://spark-master:7077"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  airflow-webserver:
+    image: apache/airflow:2.2.3
+    container_name: airflow-webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-ssafyuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-news}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    ports:
+      - "8083:8080"
+    command: >
+      airflow webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - data-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.2.3
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-webserver
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-ssafyuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-news}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: scheduler
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    networks:
+      - data-network
+
+  back:
+    build:
+      context: ../../back-pjt
+      dockerfile: Dockerfile
+    container_name: back
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_NAME=${POSTGRES_DB:-news}
+      - DB_USERNAME=${POSTGRES_USER:-ssafyuser}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+    depends_on:
+      - postgres
+    networks:
+      - data-network
+
+  producer:
+    build:
+      context: ../producer
+      dockerfile: Dockerfile
+    container_name: producer
+    depends_on:
+      - zookeeper
+      - kafka
+      - jobmanager
+      - taskmanager
+    networks:
+      - data-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  consumer:
+    build:
+      context: ../../data-pjt/consumer
+      dockerfile: Dockerfile
+    container_name: consumer
+    depends_on:
+      - producer
+    networks:
+      - data-network
+    env_file:
+      - ../.env
+
+  front:
+    build:
+      context: ../../front-pjt
+      dockerfile: Dockerfile
+    container_name: front
+    ports:
+      - "3000:3000"
+    depends_on:
+      - back
+    networks:
+      - data-network
+
+  report:
+    build:
+      context: ../batch
+      dockerfile: Dockerfile.airflow
+    volumes:
+      # WSL 환경에서 Windows 파일 시스템 마운트 시 사용:
+      # - /mnt/c/Users/YOUR_USERNAME/Desktop/PJT/data-pjt/batch/dags:/opt/airflow/dags
+      # - /mnt/c/Users/YOUR_USERNAME/Desktop/PJT/data-pjt/batch/dags/scripts:/opt/airflow/dags/scripts
+      # - /mnt/c/Users/YOUR_USERNAME/Desktop/PJT/data-pjt/batch/dags/data:/opt/airflow/dags/data
+      # 일반 Docker 환경에서는 상대 경로 사용:
+      - ../batch/dags:/opt/airflow/dags
+      - ../batch/dags/scripts:/opt/airflow/dags/scripts
+      - ../batch/dags/data:/opt/airflow/dags/data
+      - ./core-site.xml:/opt/airflow/hadoop/conf/core-site.xml
+      - ./hdfs-site.xml:/opt/airflow/hadoop/conf/hdfs-site.xml
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER:-ssafyuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-news}
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=True
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+      - _AIRFLOW_DB_UPGRADE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=${AIRFLOW_WWW_USER_USERNAME:-airflow}
+      - _AIRFLOW_WWW_USER_PASSWORD=${AIRFLOW_WWW_USER_PASSWORD}
+      - HADOOP_CONF_DIR=/opt/airflow/hadoop/conf
+      - HADOOP_HOME=/opt/airflow/hadoop
+      - SPARK_MODE=standalone
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    networks:
+      - data-network
+    command: >
+      bash -c "
+        airflow webserver & 
+        airflow scheduler
+      "
+
+networks:
+  data-network:
+    driver: bridge
+
+volumes:
+  pg_data:
+  es_data:
+  hadoop_namenode:
+  hadoop_datanode: 
+
+# 압축 한번에 시작하는 코드
+#1 chmod +x start_all.sh
+#2 ./start_all.sh
+# 오류 발생시
+#sudo apt-get update && sudo apt-get install -y dos2unix
+# dos2unix 파일명.sh
+
+# 시작 명령어 순서.airflow db 초기화 필요
+# docker-compose run --rm airflow-webserver airflow db init
+
+# 1. 기반 인프라 시작
+
+# DB와 백엔드
+# docker-compose up -d postgres
+# docker-compose up -d back
+
+# HDFS 시작
+# docker-compose up -d namenode datanode
+
+
+# 2. 데이터 파이프라인 구축
+#KAFKA 시작
+# docker-compose up -d zookeeper kafka
+# docker exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic article --partitions 1 --replication-factor 1
+
+# Flink 시작
+# docker-compose up -d jobmanager taskmanager
+
+# Elasticsearch 시작
+# docker-compose up -d elasticsearch
+
+# 3. 적재 시작
+# docker-compose up consumer
+# docker-compose up producer
+
+
+#4. 리포트 생성
+
+# Spark 시작
+# docker-compose up -d spark-master
+# docker-compose up -d spark-worker
+
+# docker-compose up -d report
+# 5. 프론트엔드 시작
+# docker-compose up front
+
